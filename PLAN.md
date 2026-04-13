@@ -153,6 +153,17 @@ Seed `shelf_life_rules` with ~20 common categories: `dairy`, `eggs`, `raw_poultr
 
 ### 0.4 App skeleton
 
+> **Status: shipped.** All files below exist as compiling stubs. `npm run typecheck`, `npm run lint`, and `npm run build` are all clean (14 routes generated). A dev-server smoke test returned 200 on every page route and 501 on both API stubs.
+>
+> **Decisions made beyond the bare spec below:**
+> - `middleware.ts` calls `updateSession` from [src/lib/supabase/middleware.ts](src/lib/supabase/middleware.ts), which falls through to `NextResponse.next()` when `NEXT_PUBLIC_SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_ANON_KEY` are missing. This keeps the 0.4 skeleton bootable without a Supabase project, and the actual route-gating redirect lands in 0.5.
+> - Supabase + Groq clients are **lazy**: they read env vars inside factory functions (`createClient`, `getGroqClient`) rather than at module load, so importing them at build time doesn't crash the generator.
+> - Lib stubs (`parseReceipt`, `suggestMeals`, `runOcr`, `estimateExpiration`) throw `Error('… not implemented (Phase X.Y)')`. Unused `_`-prefixed params required an ESLint rule — added `argsIgnorePattern: "^_"` to [.eslintrc.json](.eslintrc.json).
+> - `src/lib/validation/schemas.ts` ships **real** Zod schemas for Phase 1/3 payloads (`parsedReceiptItemSchema`, `mealSuggestionSchema`, etc.) since components already import the inferred types.
+> - The shadcn `Button` in this template is a Base UI wrapper with **no `asChild` prop**, so the receipts page uses `<Link className={buttonVariants()}>` instead of `<Button asChild>`. Apply the same pattern anywhere you need a link styled as a button.
+> - API stubs at [src/app/api/receipts/parse/route.ts](src/app/api/receipts/parse/route.ts) and [src/app/api/meals/suggest/route.ts](src/app/api/meals/suggest/route.ts) return `{ ok: false, error: 'not_implemented' }` with HTTP 501 until Phases 1.3 and 3.1 wire them up.
+> - **Tracked gap:** middleware currently refreshes the Supabase session on every request but does **not** redirect unauthenticated users — that's intentional, it lands in 0.5 alongside the login form.
+
 Folder layout:
 ```
 src/

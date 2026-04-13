@@ -82,9 +82,21 @@ src/
     validation/      # Zod schemas
   components/
     ui/              # shadcn/ui primitives
+    common/          # shared layout (Nav)
+    pantry/          # pantry list + item cards
+    receipts/        # receipt uploader
+    meals/           # meal cards
+  middleware.ts      # Supabase session refresh + route gate
 supabase/
   migrations/        # SQL migrations
 ```
+
+## Phase progress
+
+- **Phase 0.1 – tooling**: Next.js 14 + Tailwind v4 + shadcn/ui + Base UI primitives.
+- **Phase 0.3 – database schema**: three migrations under [supabase/migrations/](supabase/migrations/). Apply with `npx supabase db push`.
+- **Phase 0.4 – app skeleton**: route groups `(auth)` and `(app)`, protected shell layout with `Nav`, stub API handlers for `/api/receipts/parse` and `/api/meals/suggest` (return `501` until wired), and lazy Supabase/Groq client helpers. Middleware is a no-op when env vars are missing so the app boots without Supabase configured.
+- **Phase 0.5 – auth wiring** (next): real `/login` + `/signup` forms, redirect unauthenticated users from `(app)/*`.
 
 ## Hard constraints
 

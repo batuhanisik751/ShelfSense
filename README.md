@@ -30,6 +30,32 @@ Required env vars (see [.env.example](.env.example)):
 | `SUPABASE_SERVICE_ROLE_KEY` | **server-only** | never import from a client component |
 | `GROQ_API_KEY` | **server-only** | used by `/api` route handlers |
 
+## Database setup
+
+SQL lives in [supabase/migrations/](supabase/migrations/). Three migrations ship the initial schema:
+
+- `0001_init.sql` — tables (`profiles`, `receipts`, `pantry_items`, `meal_suggestions`, `shelf_life_rules`), `pantry_status` enum, RLS on every user-owned table, indexes, and a `handle_new_user` trigger that auto-creates a profile row on signup.
+- `0002_shelf_life_seed.sql` — seeds `shelf_life_rules` with 20 common food categories. Idempotent.
+- `0003_storage_policies.sql` — owner-scoped RLS on the `receipts` storage bucket for all four CRUD ops.
+
+Apply them to your linked Supabase project:
+
+```bash
+npx supabase link --project-ref <your-project-ref>  # one-time, find the ref in the dashboard URL
+npx supabase db push
+```
+
+Local iteration (requires Docker):
+
+```bash
+npx supabase start           # boot local Postgres + Studio
+npx supabase db reset        # reapply all migrations from scratch
+npx supabase db lint         # schema sanity check
+npx supabase stop            # tear down when done
+```
+
+The `receipts` storage bucket must exist and be **private**; create it in the dashboard before running the app. The object-level RLS policies in `0003` assume it exists.
+
 ## Scripts
 
 ```bash

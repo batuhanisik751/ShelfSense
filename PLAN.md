@@ -74,6 +74,15 @@ This document is the full step-by-step build plan, organized into phases. Each p
 
 ### 0.3 Database schema (SQL migration)
 
+> **Status: shipped.** Implemented in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql), [0002_shelf_life_seed.sql](supabase/migrations/0002_shelf_life_seed.sql), and [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql). Verified locally with `supabase db reset` + a functional RLS cross-user test (11/11). Not yet pushed to remote — run `npx supabase db push` when ready.
+>
+> **Decisions made beyond the bare spec below:**
+> - Added a `handle_new_user` trigger (`security definer`, `set search_path = public`) so signup auto-populates `public.profiles` without needing a server-action post-signup hook.
+> - Added indexes on the hot query paths: `pantry_items(user_id, status)`, `pantry_items(user_id, estimated_expiration_at)`, `pantry_items(receipt_id)`, `receipts(user_id, uploaded_at desc)`, `meal_suggestions(user_id, created_at desc)`.
+> - `shelf_life_rules` has RLS enabled with a `using (true)` select policy and no write policies, so only the service role can seed/modify it.
+> - Storage RLS moved into a third migration [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql) covering SELECT/INSERT/UPDATE/DELETE on the `receipts` bucket. The UPDATE policy uses `with check` to block path-rename escapes into another user's folder. The bucket itself is created in the Supabase dashboard (Phase 0.2), not in SQL.
+> - **Tracked gap:** `pantry_items.receipt_id` is not cross-checked against the row owner of the referenced receipt. A malicious client could insert their own row linked to another user's receipt id; no data leak (RLS on `receipts` still blocks reads), but worth revisiting if the threat model tightens.
+
 Create `supabase/migrations/0001_init.sql`:
 
 ```sql

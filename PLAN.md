@@ -16,7 +16,7 @@ This document is the full step-by-step build plan, organized into phases. Each p
 | File storage | Supabase Storage | 1 GB free, 50 MB max file size. Receipts bucket. |
 | AI | Groq `llama-3.1-8b-instant` | Text-only, JSON mode, 30 RPM / 14.4K RPD free. |
 | OCR | Tesseract.js (client-side) primary; fallback to a server route | Client OCR keeps Groq-bound serverless functions short. |
-| Styling | Tailwind CSS + shadcn/ui | Fast, polished UI components. |
+| Styling | Tailwind v4 + shadcn/ui (Base UI primitives, `sonner` toasts) | Fast, polished UI components. |
 | Validation | Zod | Validate Groq JSON outputs and form input. |
 | State | React Server Components + minimal client state | Avoid heavy client stores. |
 | Deployment | Vercel (frontend/API), Supabase (DB/storage/auth) | Render is **not** used. |
@@ -34,39 +34,43 @@ This document is the full step-by-step build plan, organized into phases. Each p
 **Goal:** A running Next.js app connected to Supabase and Groq, deployable to Vercel, with auth and base routing in place.
 
 ### 0.1 Repository & tooling
-1. Initialize Next.js 14 with TypeScript, App Router, Tailwind, ESLint:
+1. Initialize Next.js 14 with TypeScript, App Router, Tailwind, ESLint. The directory name must be lowercase (npm package name rule), so scaffold in a temp folder and move the files into the repo root:
    ```bash
-   npx create-next-app@latest . --typescript --tailwind --app --eslint --src-dir
+   npx create-next-app@14 shelfsense --typescript --tailwind --app --eslint --src-dir --import-alias "@/*" --use-npm
    ```
 2. Install core dependencies:
    ```bash
    npm i @supabase/supabase-js @supabase/ssr groq-sdk zod tesseract.js date-fns lucide-react
    npm i -D @types/node prettier
    ```
-3. Add shadcn/ui:
+3. Add shadcn/ui. `shadcn@latest` (v4) targets Tailwind v4 + Base UI and uses `sonner` in place of the removed `toast` component, so upgrade Tailwind in the same step:
    ```bash
-   npx shadcn@latest init
-   npx shadcn@latest add button card input label dialog dropdown-menu badge toast skeleton
+   npx shadcn@latest init -y -d
+   npx shadcn@latest add button card input label dialog dropdown-menu badge skeleton sonner -y
+   npm uninstall tailwindcss
+   npm i -D tailwindcss@^4 @tailwindcss/postcss@^4
    ```
-4. Set up `.env.local` with placeholder keys:
+   Then delete the scaffolded `tailwind.config.ts` (v4 is CSS-based via `@theme`), point `postcss.config.mjs` at `@tailwindcss/postcss`, and rewrite `src/app/globals.css` with `@import "tailwindcss"` plus a `@theme inline` block that maps the shadcn CSS variables (`--color-border: var(--border)`, etc.) so classes like `border-border` resolve.
+4. Set up `.env` with placeholder keys:
    ```
    NEXT_PUBLIC_SUPABASE_URL=
    NEXT_PUBLIC_SUPABASE_ANON_KEY=
    SUPABASE_SERVICE_ROLE_KEY=
    GROQ_API_KEY=
    ```
-5. Add `.env.example` mirroring the above (committed).
-6. Add `prettier.config.js`, ensure `next.config.mjs` allows Supabase image domains.
-7. Configure `vercel.json` if needed for max function duration:
+5. Add `.env.example` mirroring the above (committed). Extend `.gitignore` to ignore `.env` in addition to `.env*.local` — the Next.js default only covers the latter.
+6. Add `prettier.config.js`, ensure `next.config.mjs` allows Supabase image domains via `images.remotePatterns`.
+7. Configure `vercel.json` for max function duration:
    ```json
    { "functions": { "src/app/api/**/route.ts": { "maxDuration": 60 } } }
    ```
+8. Add `typecheck` and `format` scripts to `package.json` (`tsc --noEmit` and `prettier --write .`).
 
 ### 0.2 Supabase project
 1. Create a Supabase project (use one of the 2 free slots).
 2. Enable Email auth; optionally enable Google OAuth.
 3. Create a public bucket named `receipts` with RLS, **owner-only read/write**.
-4. Save URL, anon key, and service-role key to `.env.local` and Vercel project env.
+4. Save URL, anon key, and service-role key to `.env` and Vercel project env.
 
 ### 0.3 Database schema (SQL migration)
 

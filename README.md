@@ -108,6 +108,27 @@ supabase/
 - **Phase 0.3 – database schema**: three migrations under [supabase/migrations/](supabase/migrations/). Apply with `npx supabase db push`.
 - **Phase 0.4 – app skeleton**: route groups `(auth)` and `(app)`, protected shell layout with `Nav`, stub API handlers for `/api/receipts/parse` and `/api/meals/suggest` (return `501` until wired), and lazy Supabase/Groq client helpers.
 - **Phase 0.5 – auth wiring**: passwordless magic-link sign-in via `@supabase/ssr`. Middleware redirects unauthed traffic from `(app)/*` to `/login?redirectTo=…` and bounces authed users off `/login` + `/signup`; fails closed when Supabase env vars are missing. `/auth/callback` handles the PKCE code exchange. `Nav` shows the signed-in email and a sign-out server action. Profile rows are created automatically by the `handle_new_user` trigger in `0001_init.sql`.
+- **Phase 0.6 – deploy**: live on Vercel Hobby with `production` as the tracked branch. Only pushes to `production` trigger a build (`vercel.json` blocks `main`, project-level `commandForIgnoringBuildStep` skips every other branch). Supabase migrations are applied to the linked remote project and the Auth dashboard is configured (Site URL, redirect allow-list, email signups). All five env vars are set in Vercel Production scope only. See [Deployment](#deployment) for the wiring.
+
+## Deployment
+
+Production runs on Vercel Hobby with a **production-only** git strategy — only pushes to a branch literally named `production` trigger a build. `main` and any feature branch are dropped before the build step.
+
+Two layers enforce this:
+
+1. `vercel.json` sets `git.deploymentEnabled.main = false` — Vercel will not create a deployment for pushes to `main`.
+2. The project's **Ignored Build Step** is set to `if [ "$VERCEL_GIT_COMMIT_REF" = "production" ]; then exit 1; else exit 0; fi` via `PATCH /v9/projects/{id}` on `commandForIgnoringBuildStep`. Exit code semantics are inverted (exit 1 = build, exit 0 = skip), so any branch other than `production` is hard-skipped even if someone edits `vercel.json` out of spec.
+
+The project's **Production Branch** was flipped from the default `main` to `production` via the undocumented `PATCH /v9/projects/{id}/branch` endpoint — the Vercel CLI does not currently expose this setting.
+
+Environment variables live in **Vercel → Project Settings → Environment Variables, Production scope only**. Since `NEXT_PUBLIC_*` vars are inlined at build time, any change in Vercel needs a new build — push an empty commit to `production` to rebuild:
+
+```bash
+git commit --allow-empty -m "chore: rebuild with env vars"
+git push origin production
+```
+
+The `NEXT_PUBLIC_SITE_URL` value must match the Supabase Auth **Site URL** and appear on the Supabase Auth **Redirect URLs** allow-list (as `https://<host>/auth/callback`), otherwise magic-link emails will 404 on click.
 
 ## Hard constraints
 

@@ -74,7 +74,7 @@ This document is the full step-by-step build plan, organized into phases. Each p
 
 ### 0.3 Database schema (SQL migration)
 
-> **Status: shipped.** Implemented in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql), [0002_shelf_life_seed.sql](supabase/migrations/0002_shelf_life_seed.sql), and [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql). Verified locally with `supabase db reset` + a functional RLS cross-user test (11/11). Not yet pushed to remote — run `npx supabase db push` when ready.
+> **Status: shipped.** Implemented in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql), [0002_shelf_life_seed.sql](supabase/migrations/0002_shelf_life_seed.sql), and [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql). Verified locally with `supabase db reset` + a functional RLS cross-user test (11/11). Applied to the linked remote Supabase project during Phase 0.6; `npx supabase db push` reports "Remote database is up to date."
 >
 > **Decisions made beyond the bare spec below:**
 > - Added a `handle_new_user` trigger (`security definer`, `set search_path = public`) so signup auto-populates `public.profiles` without needing a server-action post-signup hook.
@@ -218,11 +218,23 @@ Passwordless magic-link auth via `@supabase/ssr`. Shipped in these files:
 
 **Audits run**: `rls-security-auditor` and `ui-polish-reviewer`. All HIGH/MEDIUM findings fixed before merge (host-header injection, fail-closed middleware, sanitized callback errors, validated `returnPath`, dark-mode-safe semantic tokens, mobile nav overflow).
 
-### 0.6 Exit criteria for Phase 0
-- App builds and deploys to Vercel.
-- A user can sign up, log in, and reach an empty `/pantry` page.
-- DB tables exist with RLS enforced.
-- Env vars set in Vercel.
+### 0.6 Exit criteria for Phase 0 — complete
+
+> **Status: shipped.** Live on Vercel Hobby at `https://shelfsense-pi.vercel.app`. All four exit criteria satisfied:
+> - ✅ App builds and deploys to Vercel — deployment `dpl_EF4cUU4UmvwJ3f3bdwWXnBu1g8nG` on sha `3429787` is READY.
+> - ✅ Sign up / log in / empty `/pantry` wiring verified end-to-end. Protected routes 307 to `/login?redirectTo=…` (no longer the fail-closed `?error=Auth%20is%20not%20configured` path), `/auth/callback` handles PKCE, Supabase Auth dashboard is configured (Site URL, redirect allow-list, email signups).
+> - ✅ DB tables + RLS applied to the remote Supabase project (see 0.3 status note).
+> - ✅ All five env vars set in Vercel Production scope only.
+>
+> **Decisions made beyond the bare spec above:**
+> - **Production-only git strategy.** The Vercel project tracks a branch literally named `production`. `main` is retained as an integration branch but never deploys.
+> - **Two layers of branch gating:**
+>   1. [vercel.json](vercel.json) sets `git.deploymentEnabled.main = false` so Vercel never creates a deployment for `main` pushes.
+>   2. The project's `commandForIgnoringBuildStep` was set via `PATCH /v9/projects/{id}` to `if [ "$VERCEL_GIT_COMMIT_REF" = "production" ]; then exit 1; else exit 0; fi` — any branch other than `production` is hard-skipped before build, closing the "future feature branch" gap that `vercel.json` alone cannot cover.
+> - **Production branch flipped via undocumented API.** Vercel's CLI does not expose the production-branch setting. It was changed from `main` → `production` via `PATCH /v9/projects/{id}/branch` with `{"branch":"production"}` — the same endpoint the Vercel dashboard uses internally.
+> - **No preview or development env vars.** All five env vars are scoped to Production only. Preview and Development are intentionally empty because those branches never deploy anyway.
+> - **Rebuild ritual.** `NEXT_PUBLIC_*` vars are inlined at build time, so changes in Vercel require a new build. Push an empty commit to `production` (`git commit --allow-empty -m … && git push origin production`) — the initial deployment was rebuilt this way after env vars landed.
+> - **Tracked gap:** the production URL `shelfsense-pi.vercel.app` is a Vercel-generated alias. If a custom domain is added later, update `NEXT_PUBLIC_SITE_URL` in Vercel, the Supabase Auth Site URL, and the Supabase redirect allow-list in lockstep.
 
 ---
 

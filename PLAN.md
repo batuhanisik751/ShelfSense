@@ -198,11 +198,25 @@ src/
   middleware.ts               # auth gate
 ```
 
-### 0.5 Auth wiring
-1. Implement Supabase server/client helpers using `@supabase/ssr`.
-2. Add `middleware.ts` to redirect unauthenticated users from `(app)/*` to `/login`.
-3. Build `/login` and `/signup` with email-link auth.
-4. After signup, insert into `profiles` via DB trigger (or post-signup server action).
+### 0.5 Auth wiring — complete
+
+Passwordless magic-link auth via `@supabase/ssr`. Shipped in these files:
+
+- [src/lib/supabase/server.ts](src/lib/supabase/server.ts), [src/lib/supabase/client.ts](src/lib/supabase/client.ts), [src/lib/supabase/middleware.ts](src/lib/supabase/middleware.ts) — anon-key server/client/middleware helpers (no service-role on the client).
+- [src/middleware.ts](src/middleware.ts) + `updateSession` — refreshes the Supabase session on every request, redirects unauthed users from `/dashboard`, `/pantry`, `/receipts`, `/meals` (and nested paths) to `/login?redirectTo=…`, and bounces authed users off `/login` + `/signup`. Fails closed: missing Supabase env vars redirect protected routes to `/login` instead of silently passing through.
+- [src/app/(auth)/actions.ts](src/app/(auth)/actions.ts) — `sendMagicLink` (calls `signInWithOtp`) and `signOut` server actions. Origin is derived from `NEXT_PUBLIC_SITE_URL` (not trusted forwarded headers) to block host-header injection. `redirectTo` and `returnPath` are validated to `/`-prefixed internal paths only.
+- [src/app/(auth)/login/page.tsx](src/app/(auth)/login/page.tsx), [src/app/(auth)/signup/page.tsx](src/app/(auth)/signup/page.tsx) — shadcn-styled forms with error / sent states, `aria-describedby`, and a `useFormStatus`-driven pending button at [src/app/(auth)/SubmitButton.tsx](src/app/(auth)/SubmitButton.tsx).
+- [src/app/auth/callback/route.ts](src/app/auth/callback/route.ts) — PKCE `exchangeCodeForSession` handler. Rejects absent codes, sanitizes Supabase errors to a generic string, and restricts `next` to internal paths.
+- [src/components/common/Nav.tsx](src/components/common/Nav.tsx) — async server component showing the signed-in email plus a sign-out form action. Link list hides on mobile to prevent overflow.
+- **Profile row on signup**: already handled by the `handle_new_user` trigger in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql) — no extra server action needed.
+- [.env.example](.env.example) documents the new `NEXT_PUBLIC_SITE_URL` var.
+
+**Required Supabase dashboard setup** (otherwise magic links 404):
+1. Authentication → URL Configuration → Site URL = `NEXT_PUBLIC_SITE_URL`.
+2. Add `http://localhost:3000/auth/callback` and the production callback to the Redirect URLs allow-list.
+3. Authentication → Providers → Email → enable signups.
+
+**Audits run**: `rls-security-auditor` and `ui-polish-reviewer`. All HIGH/MEDIUM findings fixed before merge (host-header injection, fail-closed middleware, sanitized callback errors, validated `returnPath`, dark-mode-safe semantic tokens, mobile nav overflow).
 
 ### 0.6 Exit criteria for Phase 0
 - App builds and deploys to Vercel.

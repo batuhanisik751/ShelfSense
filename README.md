@@ -25,10 +25,20 @@ Required env vars (see [.env.example](.env.example)):
 
 | Var | Scope | Notes |
 |---|---|---|
+| `NEXT_PUBLIC_SITE_URL` | public | Canonical origin for magic-link callbacks. Required in production; must be on the Supabase Auth redirect allow-list |
 | `NEXT_PUBLIC_SUPABASE_URL` | public | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | public | anon key, RLS-scoped |
 | `SUPABASE_SERVICE_ROLE_KEY` | **server-only** | never import from a client component |
 | `GROQ_API_KEY` | **server-only** | used by `/api` route handlers |
+
+### Supabase auth configuration
+
+The app uses passwordless magic-link auth. Before the first login works end-to-end:
+
+1. In the Supabase dashboard, go to **Authentication → URL Configuration**.
+2. Set **Site URL** to match `NEXT_PUBLIC_SITE_URL`.
+3. Add `http://localhost:3000/auth/callback` and your production `…/auth/callback` to the **Redirect URLs** allow-list.
+4. Make sure **Enable email signups** is on (Authentication → Providers → Email).
 
 ## Database setup
 
@@ -71,8 +81,9 @@ npm run format     # prettier --write .
 ```
 src/
   app/
-    (auth)/          # login, signup
+    (auth)/          # login, signup, shared magic-link server actions
     (app)/           # protected routes: dashboard, pantry, receipts, meals
+    auth/callback/   # PKCE code-exchange route handler
     api/             # route handlers (Groq calls live here)
   lib/
     supabase/        # server + client + middleware helpers
@@ -95,8 +106,8 @@ supabase/
 
 - **Phase 0.1 – tooling**: Next.js 14 + Tailwind v4 + shadcn/ui + Base UI primitives.
 - **Phase 0.3 – database schema**: three migrations under [supabase/migrations/](supabase/migrations/). Apply with `npx supabase db push`.
-- **Phase 0.4 – app skeleton**: route groups `(auth)` and `(app)`, protected shell layout with `Nav`, stub API handlers for `/api/receipts/parse` and `/api/meals/suggest` (return `501` until wired), and lazy Supabase/Groq client helpers. Middleware is a no-op when env vars are missing so the app boots without Supabase configured.
-- **Phase 0.5 – auth wiring** (next): real `/login` + `/signup` forms, redirect unauthenticated users from `(app)/*`.
+- **Phase 0.4 – app skeleton**: route groups `(auth)` and `(app)`, protected shell layout with `Nav`, stub API handlers for `/api/receipts/parse` and `/api/meals/suggest` (return `501` until wired), and lazy Supabase/Groq client helpers.
+- **Phase 0.5 – auth wiring**: passwordless magic-link sign-in via `@supabase/ssr`. Middleware redirects unauthed traffic from `(app)/*` to `/login?redirectTo=…` and bounces authed users off `/login` + `/signup`; fails closed when Supabase env vars are missing. `/auth/callback` handles the PKCE code exchange. `Nav` shows the signed-in email and a sign-out server action. Profile rows are created automatically by the `handle_new_user` trigger in `0001_init.sql`.
 
 ## Hard constraints
 

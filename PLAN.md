@@ -304,6 +304,30 @@ Steps:
 
 ### 1.2 OCR (client-side primary)
 
+> **Status: shipped.** [src/lib/ocr/runOcr.ts](src/lib/ocr/runOcr.ts) now implements the full **compress → deskew → Tesseract → clean** pipeline behind the same `runOcr(file: File): Promise<string>` contract 1.1 handed over. The uploader, parse route, and migrations were not touched. `npm run typecheck`, `npm run lint`, and `npm run build` are all clean. End-to-end behavior: a successful upload now lands the receipt row at `status='ocr_done'` with real text in `ocr_text`, and the flow then stops at the 501 parse stub (`"Could not parse receipt."` error card) — that's the intended exit state until 1.3 lands.
+>
+> **Decisions made beyond the bare spec below:**
+> - **Storage still holds the original file**, not the compressed one. 1.1 uploads the raw `File` to `receipts/{user_id}/{uuid}.{ext}` before `runOcr` is called, and I deliberately kept that path untouched to keep 1.2 to a single file of product code. Compression happens inside `runOcr` only and is discarded after the OCR call. The "use the compressed file for both upload and OCR" suggestion in the library notes above is not currently wired — revisit in Phase 4 polish if Supabase storage usage becomes a concern.
+> - **All three new libraries are dynamically imported** (`await import(...)`) inside `runOcr` rather than statically imported at the top of the file. This defers the ~2–3 MB payload until the first upload attempt and keeps the `/receipts/upload` initial bundle small (first-load JS for that route is 201 kB per `next build` output).
+> - **jscanify is imported from the `jscanify/client` subpath**, not the package root. The root entry uses a Node-style CJS wrapper that drags in dependencies that break in the browser bundle; `jscanify/client` is the browser-only UMD entry that jscanify ships for exactly this case. A tiny ambient shim at [src/types/jscanify.d.ts](src/types/jscanify.d.ts) declares the class shape since jscanify ships no types.
+> - **OpenCV.js is loaded from `https://docs.opencv.org/4.10.0/opencv.js`**, not the `4.x` floating alias. Pinning a concrete version blocks the "vendor silently updates the alias" risk surfaced by the security audit.
+> - **OpenCV load failures don't permanently disable deskew.** The `opencvPromise` module-level cache is **cleared on rejection** so a single CDN hiccup doesn't brick the feature for the rest of the session — the next upload retries the script load. A successful resolution is cached forever per the usual pattern.
+> - **pdfjs worker is loaded from `cdnjs.cloudflare.com/.../pdf.js/5.6.205/pdf.worker.min.mjs`**, not the `?url` bundler path. The `?url` path wasn't attempted because pdfjs v5's ESM worker resolution through Next.js 14's webpack config is fragile and the CDN URL is simpler to reason about. The worker URL is pinned to the exact installed version and is set once per session via a module-level guard (`pdfjsWorkerSet`).
+> - **`next.config.mjs` now aliases `canvas: false` on client builds** so `pdfjs-dist` doesn't try to resolve the Node-only `canvas` dependency at webpack time. Server builds are unaffected (guarded by `!isServer`).
+> - **`page.render` passes both `canvas` and `canvasContext`** — pdfjs v5 accepts either and there's a small API churn in v5 around which is required. Passing both is belt-and-braces and is what the current typedefs tolerate.
+> - **`cleanOcrText` is exported** (not just used internally) so future callers (tests, server-side cleanup scripts) can hit the same normalizer without importing the whole browser pipeline. It does: `\r\n → \n`, lowercase, collapse whitespace per line, drop lines shorter than 3 chars, truncate at 8000 chars. Empty output is a valid return — the uploader still flips to `ocr_done` and hands off to the parse step.
+> - **Deskew swallows every failure** (OpenCV timeout, OpenCV load error, jscanify throw, no quad detected) and falls back to the raw image. The only visible side effect is one `console.warn('[ocr] deskew skipped:', err)` per failure.
+>
+> **Audit (`rls-security-auditor`):** clean on all hard rules — service-role key containment intact, no new secret references, no new Supabase queries, no new server routes. Three advisory warnings surfaced and were triaged:
+> - **MEDIUM (deferred):** no Subresource Integrity hashes on the CDN-loaded OpenCV + pdfjs worker. Revisit before any production rollout with real users — either add `integrity="sha384-..."` attributes or copy `pdfjs-dist/build/pdf.worker.min.mjs` into `public/` at install time. Out of scope for dev-phase 1.2 because the parse route is still a 501 stub and no users are touching this.
+> - **LOW (fixed):** OpenCV URL pinned from `4.x` → `4.10.0`.
+> - **LOW (fixed):** `opencvPromise` reset-on-rejection so a single CDN failure doesn't permanently disable deskew.
+> - **LOW (deferred):** no CSP header in `next.config.mjs` or `middleware.ts`. Pre-existing gap — tracking for Phase 4.
+>
+> **End-to-end right now (as of 1.2):** upload → storage → DB row (`pending`) → `runOcr` runs the real pipeline → row patched to `ocr_done` with populated `ocr_text` → `POST /api/receipts/parse` returns 501 → uploader surfaces `"Could not parse receipt."`. The `status='failed'` path now only fires when `runOcr` actually throws (corrupt PDF, Tesseract crash, etc.), not on every upload. When 1.3 lands, the uploader reaches `done` without further edits — the contract is intact.
+>
+> **Notes for 1.3 handoff (`groq-prompt-engineer`):** `runOcr` returns text that is already lowercased, whitespace-collapsed, and capped at 8000 chars. The Groq system prompt should assume lowercase input. Empty string is possible (blurry photo, OpenCV failure compounded with an unreadable image) — the parse route should treat `ocr_text === ''` as "0 items" rather than throwing.
+
 **File:** [src/lib/ocr/runOcr.ts](src/lib/ocr/runOcr.ts)
 
 The OCR pipeline is **compress → deskew → Tesseract → clean**. Three libraries carry the first three steps so we don't have to hand-roll image ops.
@@ -348,6 +372,31 @@ export async function runOcr(file: File): Promise<string> {
 **Why client-side:** keeps the Vercel function under its 10–60s window and avoids server-side image processing.
 
 ### 1.3 Groq receipt parser
+
+> **Status: shipped.** [src/lib/groq/parseReceipt.ts](src/lib/groq/parseReceipt.ts) and [src/app/api/receipts/parse/route.ts](src/app/api/receipts/parse/route.ts) are now fully wired. A successful upload now walks all the way through: storage → `pending` → real OCR → `ocr_done` with populated `ocr_text` → Groq parse + Fuse category resolve → `pantry_items` insert → `parsed` → success toast with a **View pantry** link. `npm run typecheck`, `npm run lint`, and `npm run build` are all clean.
+>
+> **Decisions made beyond the bare spec below:**
+> - **`parseReceipt(ocrText, categoryKeys)` takes the category list as a second argument** instead of fetching from `shelf_life_rules` itself. The route handler fetches the keys once per request and passes them in, keeping the Groq helper pure (no DB coupling, trivially testable).
+> - **Hand-authored JSON schema const, not `zod-to-json-schema`.** The library is incompatible with Zod v4 (produces an empty `$ref` schema), so `RECEIPT_SCHEMA_JSON` in `parseReceipt.ts` mirrors `parsedReceiptItemSchema` by hand with a one-line WHY comment above it. The unused `zod-to-json-schema` dep was removed from `package.json` per the audit's must-fix. If `zod-to-json-schema` ships Zod v4 support later, swap the const for a generated schema and delete the comment.
+> - **Empty-OCR short-circuit.** `parseReceipt` returns `[]` immediately when `ocrText.trim() === ''` — blurry photos / OpenCV-disabled sessions don't burn Groq tokens. The route handles zero-items gracefully (no insert, still flips to `parsed`).
+> - **Fuse two-tier resolve.** Each item's category is resolved via `fuse.search(normalized_name)[0]` first, then `fuse.search(category)[0]`, then `'other'`. This catches the common case where Groq emits `category: "produce"` but `normalized_name: "romaine lettuce"` — we want it to land on `'leafy_greens'`.
+> - **Route auth-gates before any DB or Groq call.** `supabase.auth.getUser()` runs first, returns 401 on no session. A caller without a cookie burns zero Groq tokens and reads zero OCR text.
+> - **Zod-validates the body** (`receiptId: z.string().uuid()`) before any DB query. Malformed JSON returns 400, invalid body returns 400.
+> - **Fail-path flips `status='failed'`** on Groq/Zod failure OR on pantry insert failure, via the RLS-scoped client (no explicit `user_id` filter needed — `auth.uid() = user_id` policy covers it). The success path flips to `'parsed'` at the end.
+> - **Response body is minimal**: `{ ok: true, count }`. No echoing of parsed items back to the client — the uploader only checks `res.ok`, so there's no reason to expand the response surface.
+> - **`estimated_expiration_at` stays `null` and `status='fresh'`** on every inserted item. Phase 2 will fill in real expiration dates and computed statuses; 1.3 deliberately stops at `null` per the spec.
+> - **`parsedReceiptSchema` already existed** in [src/lib/validation/schemas.ts](src/lib/validation/schemas.ts) from Phase 0.4 — reused, not redefined.
+> - **Dev-mode token logging.** `parseReceipt` prints `{ prompt, completion, total }` token counts to the console only when `NODE_ENV === 'development'`, so you can eyeball token burn while iterating without noisy production logs.
+>
+> **Audit (`rls-security-auditor`):** clean on all hard rules — 401 gate before any side effect, RLS scoping on every query, `user_id` sourced from the session (not the client body), `SUPABASE_SERVICE_ROLE_KEY` containment intact, `GROQ_API_KEY` server-only, no retry loops, no secrets in logs. One must-fix (unused `zod-to-json-schema` dep) was addressed inline. Two advisory warnings triaged:
+> - `receipts.update({status:'failed'})` on the error path doesn't carry an explicit `user_id` filter — accepted, RLS covers it, and the alternative would be dead code.
+> - Middleware `PROTECTED_PREFIXES` doesn't include `/api/receipts/parse` — accepted, API routes are gated in-handler per Next.js convention.
+>
+> **End-to-end right now (as of 1.3):** upload → storage → `pending` → real `runOcr` → `ocr_done` → `POST /api/receipts/parse` (real Groq + Fuse + DB insert) → `parsed` → success toast → items visible on `/pantry`. The `ocr_done` rows left behind by 1.2 testing are not automatically advanced by 1.3 — the uploader only POSTs on fresh uploads. Re-upload to see parsed results for an old receipt. Stale `failed` rows from 1.1/1.2 testing are also untouched.
+>
+> **Notes for 1.4 handoff (`nextjs-builder`, pantry page):** `pantry_items` rows inserted by 1.3 have `estimated_expiration_at=null` and `status='fresh'` — the pantry page should render those fields gracefully until Phase 2 fills them in. The `category` field is always one of the `shelf_life_rules` keys or the literal string `'other'` — never a free-form Groq string.
+>
+> **Notes for Phase 2 handoff (`shelf-life-researcher` / `supabase-architect`):** every row also has a valid `receipt_id` and `purchased_at` (derived from `receipts.uploaded_at::date`), so the expiration estimator has everything it needs — no backfill from OCR text required.
 
 **File:** [src/lib/groq/parseReceipt.ts](src/lib/groq/parseReceipt.ts)
 

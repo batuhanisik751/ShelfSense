@@ -39,3 +39,10 @@ supabase/.branches/
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local test fixtures (receipts, scans, etc.) — never commit these
+photo_test_*.*
+*.local.jpeg
+*.local.jpg
+*.local.png
+*.local.pdf

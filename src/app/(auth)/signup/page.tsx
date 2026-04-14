@@ -1,8 +1,10 @@
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { sendMagicLink } from '../actions';
 import { SubmitButton } from '../SubmitButton';
+import { isAuthBypassed } from '@/lib/auth/bypass';
 
 type SearchParams = {
   error?: string;
@@ -12,6 +14,10 @@ type SearchParams = {
 };
 
 export default function SignupPage({ searchParams }: { searchParams: SearchParams }) {
+  if (isAuthBypassed()) {
+    redirect('/dashboard');
+  }
+
   const sent = searchParams.sent === '1';
   const redirectTo = searchParams.redirectTo ?? '/dashboard';
 

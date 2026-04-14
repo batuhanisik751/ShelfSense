@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { createClient } from '@/lib/supabase/server';
 import { signOut } from '@/app/(auth)/actions';
 import { Button } from '@/components/ui/button';
+import { isAuthBypassed } from '@/lib/auth/bypass';
 
 const items = [
   { href: '/dashboard', label: 'Dashboard' },
@@ -11,10 +12,10 @@ const items = [
 ];
 
 export async function Nav() {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const bypassed = isAuthBypassed();
+  const user = bypassed
+    ? null
+    : (await createClient().auth.getUser()).data.user;
 
   return (
     <nav className="flex items-center justify-between gap-6 border-b px-6 py-4">
@@ -32,7 +33,11 @@ export async function Nav() {
           ))}
         </ul>
       </div>
-      {user ? (
+      {bypassed ? (
+        <span className="rounded-md border border-dashed px-2 py-1 text-xs text-muted-foreground">
+          auth bypass
+        </span>
+      ) : user ? (
         <form action={signOut} className="flex items-center gap-3">
           <span className="hidden text-sm text-muted-foreground sm:inline" title={user.email ?? ''}>
             {user.email}

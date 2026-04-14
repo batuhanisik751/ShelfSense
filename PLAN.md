@@ -1,5 +1,15 @@
 # ShelfSense — Implementation Plan
 
+## Reusable Prompts
+
+**Plan mode:**
+> Plan {{PHASE/STEP}}. Follow PLAN.md for instructions. Include a thorough verification section that covers the happy path, every failure/rejection branch, auth/RLS gating, and any downstream stubs that will block full end-to-end success — spell out exact manual steps, expected UI states, expected DB/storage state, and how to confirm each one.
+
+**Edit automatically:**
+> Update .env.example, README.md, PLAN.md, and .gitignore so everything is current.
+
+---
+
 ShelfSense turns grocery receipts into a smart pantry. Users upload a receipt, OCR extracts text, Groq's `llama-3.1-8b-instant` parses items into structured data, the app estimates expiration windows, and suggests meals to reduce food waste.
 
 This document is the full step-by-step build plan, organized into phases. Each phase has a goal, deliverables, concrete steps, file-level scaffolding, and exit criteria.
@@ -74,7 +84,7 @@ This document is the full step-by-step build plan, organized into phases. Each p
 
 ### 0.3 Database schema (SQL migration)
 
-> **Status: shipped.** Implemented in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql), [0002_shelf_life_seed.sql](supabase/migrations/0002_shelf_life_seed.sql), and [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql). Verified locally with `supabase db reset` + a functional RLS cross-user test (11/11). Not yet pushed to remote — run `npx supabase db push` when ready.
+> **Status: shipped.** Implemented in [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql), [0002_shelf_life_seed.sql](supabase/migrations/0002_shelf_life_seed.sql), and [0003_storage_policies.sql](supabase/migrations/0003_storage_policies.sql). Verified locally with `supabase db reset` + a functional RLS cross-user test (11/11). Applied to the linked remote Supabase project during Phase 0.6; `npx supabase db push` reports "Remote database is up to date."
 >
 > **Decisions made beyond the bare spec below:**
 > - Added a `handle_new_user` trigger (`security definer`, `set search_path = public`) so signup auto-populates `public.profiles` without needing a server-action post-signup hook.
@@ -218,11 +228,41 @@ Passwordless magic-link auth via `@supabase/ssr`. Shipped in these files:
 
 **Audits run**: `rls-security-auditor` and `ui-polish-reviewer`. All HIGH/MEDIUM findings fixed before merge (host-header injection, fail-closed middleware, sanitized callback errors, validated `returnPath`, dark-mode-safe semantic tokens, mobile nav overflow).
 
-### 0.6 Exit criteria for Phase 0
-- App builds and deploys to Vercel.
-- A user can sign up, log in, and reach an empty `/pantry` page.
-- DB tables exist with RLS enforced.
-- Env vars set in Vercel.
+### 0.6 Exit criteria for Phase 0 — complete
+
+> **Status: shipped.** Live on Vercel Hobby at `https://shelfsense-pi.vercel.app`. All four exit criteria satisfied:
+> - ✅ App builds and deploys to Vercel — deployment `dpl_EF4cUU4UmvwJ3f3bdwWXnBu1g8nG` on sha `3429787` is READY.
+> - ✅ Sign up / log in / empty `/pantry` wiring verified end-to-end. Protected routes 307 to `/login?redirectTo=…` (no longer the fail-closed `?error=Auth%20is%20not%20configured` path), `/auth/callback` handles PKCE, Supabase Auth dashboard is configured (Site URL, redirect allow-list, email signups).
+> - ✅ DB tables + RLS applied to the remote Supabase project (see 0.3 status note).
+> - ✅ All five env vars set in Vercel Production scope only.
+>
+> **Decisions made beyond the bare spec above:**
+> - **Production-only git strategy.** The Vercel project tracks a branch literally named `production`. `main` is retained as an integration branch but never deploys.
+> - **Two layers of branch gating:**
+>   1. [vercel.json](vercel.json) sets `git.deploymentEnabled.main = false` so Vercel never creates a deployment for `main` pushes.
+>   2. The project's `commandForIgnoringBuildStep` was set via `PATCH /v9/projects/{id}` to `if [ "$VERCEL_GIT_COMMIT_REF" = "production" ]; then exit 1; else exit 0; fi` — any branch other than `production` is hard-skipped before build, closing the "future feature branch" gap that `vercel.json` alone cannot cover.
+> - **Production branch flipped via undocumented API.** Vercel's CLI does not expose the production-branch setting. It was changed from `main` → `production` via `PATCH /v9/projects/{id}/branch` with `{"branch":"production"}` — the same endpoint the Vercel dashboard uses internally.
+> - **No preview or development env vars.** All five env vars are scoped to Production only. Preview and Development are intentionally empty because those branches never deploy anyway.
+> - **Rebuild ritual.** `NEXT_PUBLIC_*` vars are inlined at build time, so changes in Vercel require a new build. Push an empty commit to `production` (`git commit --allow-empty -m … && git push origin production`) — the initial deployment was rebuilt this way after env vars landed.
+> - **Tracked gap:** the production URL `shelfsense-pi.vercel.app` is a Vercel-generated alias. If a custom domain is added later, update `NEXT_PUBLIC_SITE_URL` in Vercel, the Supabase Auth Site URL, and the Supabase redirect allow-list in lockstep.
+
+### 0.7 Dev auth bypass (local only, not a production path)
+
+> **Status: shipped (dev-only).** Iterating on `(app)/*` pages while waiting for magic-link emails was making every change take a minute. `AUTH_BYPASS=1` in `.env` now short-circuits the magic-link flow with a seeded dev user.
+>
+> **Mechanics:**
+> - [src/lib/auth/bypass.ts](src/lib/auth/bypass.ts) exposes `isAuthBypassed()` which returns `true` iff `process.env.AUTH_BYPASS === '1' && process.env.NODE_ENV !== 'production'`. Every code path that respects the flag routes through this helper — **the production gate is the `NODE_ENV` check**, so leaking `AUTH_BYPASS=1` into Vercel has no effect.
+> - [src/lib/auth/devUser.ts](src/lib/auth/devUser.ts) holds the fixed dev credentials (`dev@shelfsense.local` + a non-secret constant password). Only referenced by the dev-only route below.
+> - [src/app/api/dev/session/route.ts](src/app/api/dev/session/route.ts) is a Node-runtime GET handler that (1) refuses to run unless `isAuthBypassed()`, (2) uses `SUPABASE_SERVICE_ROLE_KEY` + `@supabase/supabase-js` admin API to `createUser({ email_confirm: true })` — idempotent, `already exists` errors are ignored — (3) creates an `@supabase/ssr` server client and calls `signInWithPassword` so real auth cookies land on the Next cookie store, and (4) redirects to `safeNext(request.nextUrl.searchParams.get('next'))`.
+> - [src/lib/supabase/middleware.ts](src/lib/supabase/middleware.ts) in bypass mode always lets `/api/dev/session` through, redirects `/login` + `/signup` to `/dashboard`, and for any protected prefix with no `sb-*-auth-token` cookie (including chunked `-auth-token.N` variants) redirects to `/api/dev/session?next=<pathname>`. First request self-heals; subsequent requests just pass through.
+> - [src/components/common/Nav.tsx](src/components/common/Nav.tsx) shows a small `auth bypass` chip in the top-right instead of the sign-out form when the flag is on. [src/app/page.tsx](src/app/page.tsx), [src/app/(auth)/login/page.tsx](src/app/(auth)/login/page.tsx), and [src/app/(auth)/signup/page.tsx](src/app/(auth)/signup/page.tsx) each short-circuit to `/dashboard` when `isAuthBypassed()` is true, so even direct-URL access can't reach the magic-link UI in dev.
+>
+> **How Phase 1.1 picks it up:** the `/receipts/upload` server component reads the user + session via `supabase.auth.getUser()` + `supabase.auth.getSession()`, then passes `userId`, `accessToken`, `refreshToken` down as props. The client `ReceiptUploader` calls `supabase.auth.setSession(...)` in a `useEffect` to force-hydrate the browser Supabase client's in-memory session. This sidesteps any client-side cookie-decode round-trip and guarantees storage uploads + DB writes carry a valid bearer token through RLS — without the uploader ever calling `auth.getUser()` on the client.
+>
+> **Rules of engagement:**
+> - **Never** set `AUTH_BYPASS` on Vercel. Force-disabled by `NODE_ENV` but leave it unset anyway for clarity.
+> - `SUPABASE_SERVICE_ROLE_KEY` has exactly one import site ([src/app/api/dev/session/route.ts](src/app/api/dev/session/route.ts)) and that route is gated by `isAuthBypassed()` before any admin call. `rls-security-auditor` should re-verify this invariant after any future auth-adjacent edit.
+> - When you want to test the real magic-link flow locally, delete `AUTH_BYPASS` from `.env` and restart dev. The dev user row stays in `auth.users` — harmless, delete from the Supabase dashboard if it bothers you.
 
 ---
 
@@ -230,14 +270,31 @@ Passwordless magic-link auth via `@supabase/ssr`. Shipped in these files:
 
 **Goal:** A user uploads one receipt and sees parsed items appear on the pantry page.
 
+**New deps this phase:**
+```bash
+npm i react-dropzone browser-image-compression jscanify pdfjs-dist zod-to-json-schema fuse.js
+```
+(`tesseract.js`, `zod`, `groq-sdk`, `date-fns` are already in the Phase 0 install.)
+
 ### 1.1 Receipt upload flow
+
+> **Status: shipped.** Only `react-dropzone` was installed for this sub-step (the other Phase-1 deps belong to 1.2 / 1.3 and are deferred). The pipeline is wired in `onDrop`: browser-client upload to `receipts/{user_id}/{uuid}.{ext}` → insert `receipts` row (`status='pending'`) → `runOcr(file)` → patch `ocr_text` + `status='ocr_done'` → `POST /api/receipts/parse` → `status='parsed'`. Progress states are `idle → uploading → ocr → parsing → done | error`; rejections (size, MIME) toast via `sonner`. The `/receipts/upload` page is now a server component that reads `auth.getUser()` + `auth.getSession()` and passes `userId`, `accessToken`, `refreshToken` as props to the client; the client calls `supabase.auth.setSession(...)` once in a `useEffect` to force-hydrate the in-memory session so the browser supabase client carries a real bearer token through RLS (no more client-side `getUser()` call). The "Upload receipt" link on `/receipts` is a plain `<a>` tag, not a `<Link>`, to bypass the Next App Router cache after we saw a stale redirect cached from an earlier iteration. `/receipts/upload` is marked `dynamic = 'force-dynamic'` + `revalidate = 0` so it never gets cached as a client prefetch.
+>
+> **End-to-end right now (as of 1.1 only):** upload → storage → DB row → `runOcr` throws (Phase 1.2 stub) → row flipped to `status='failed'` → UI shows `"OCR failed. Please try a clearer photo."`. This is the expected exit state of 1.1 in isolation and it's verified: photo lands in `receipts/{dev-user-uid}/<uuid>.jpeg`, a `failed` row appears in `public.receipts`. When 1.2 lands, this same uploader reaches `ocr_done` without further edits; when 1.3 lands it reaches `parsed` without further edits.
+>
+> **Notes for 1.2 handoff (`ocr-pipeline-specialist`):** the contract is unchanged — `runOcr(file: File): Promise<string>` in [src/lib/ocr/runOcr.ts](src/lib/ocr/runOcr.ts), currently throwing. The uploader doesn't care how the OCR works internally. For 1.2 you need to `npm i browser-image-compression jscanify pdfjs-dist` (deferred from 1.1 on purpose) and replace the stub body.
 
 **File:** [src/components/receipts/ReceiptUploader.tsx](src/components/receipts/ReceiptUploader.tsx)
 
+**Library: [`react-dropzone`](https://react-dropzone.js.org/)** — handles the file input, drag-and-drop, MIME filtering, and size validation in one hook. Saves reinventing the drop target + validation logic.
+- Install: `npm i react-dropzone`
+- Input: `useDropzone({ accept: { 'image/*': ['.png','.jpg','.jpeg','.webp'], 'application/pdf': ['.pdf'] }, maxSize: 8 * 1024 * 1024, multiple: false, onDrop })`
+- Output: `onDrop(acceptedFiles: File[], fileRejections: FileRejection[])` — rejections carry the reason (`file-too-large`, `file-invalid-type`) so you can toast the error straight from the hook.
+
 Steps:
-1. Render a file input accepting `image/png, image/jpeg, image/webp, application/pdf`.
-2. Client-side validate: max 8 MB (well below Supabase's 50 MB cap, keeps OCR quick).
-3. On select:
+1. Render the dropzone via `react-dropzone`. Spread `getRootProps()` / `getInputProps()` onto a shadcn `Card`.
+2. Size + MIME validation is handled by the hook config above — no manual checks needed.
+3. On accepted drop:
    - Upload file to Supabase Storage at `receipts/{user_id}/{uuid}.{ext}`.
    - Insert a row in `receipts` with `status='pending'`.
    - Trigger client-side OCR (see 1.2).
@@ -249,16 +306,44 @@ Steps:
 
 **File:** [src/lib/ocr/runOcr.ts](src/lib/ocr/runOcr.ts)
 
-1. Use `tesseract.js` in the browser:
-   ```ts
-   import Tesseract from 'tesseract.js';
-   export async function runOcr(file: File): Promise<string> {
-     const { data } = await Tesseract.recognize(file, 'eng', { logger: () => {} });
-     return data.text;
-   }
-   ```
-2. For PDFs: use `pdfjs-dist` to render page 1 to a canvas, then OCR the canvas.
-3. Pre-process: lowercase, strip duplicate whitespace, drop lines shorter than 3 chars before sending to Groq (saves tokens).
+The OCR pipeline is **compress → deskew → Tesseract → clean**. Three libraries carry the first three steps so we don't have to hand-roll image ops.
+
+**Library: [`browser-image-compression`](https://github.com/Donaldcwl/browser-image-compression)** — shrinks 12MP phone photos before they ever reach Tesseract. A 4000×3000 JPEG that takes ~20s to OCR becomes a 1500px image that takes ~4s with negligible accuracy loss for receipts.
+- Install: `npm i browser-image-compression`
+- Input: `File`, `{ maxWidthOrHeight: 1500, maxSizeMB: 1.5, useWebWorker: true, initialQuality: 0.85 }`
+- Output: compressed `File` — use it for both the Supabase upload *and* the OCR input.
+- Skip when `file.type === 'application/pdf'`.
+
+**Library: [`jscanify`](https://github.com/puffinsoft/jscanify)** — detects document corners and warps the image to a clean flat rectangle. Receipts are almost always photographed at an angle; feeding a deskewed canvas into Tesseract is the single biggest OCR accuracy improvement for this app.
+- Install: `npm i jscanify` (depends on OpenCV.js loaded via script tag from `https://docs.opencv.org/4.x/opencv.js`)
+- Input: `HTMLImageElement` built from the compressed file
+- Output: `HTMLCanvasElement` with the receipt extracted and flattened
+- Usage: `const scanner = new jscanify(); const canvas = scanner.extractPaper(imgEl, 1500, 2000);`
+- On failure (no quad detected) fall back to the raw image — never block the pipeline.
+
+**Library: [`tesseract.js`](https://github.com/naptha/tesseract.js)** — already in deps. Feed it the deskewed canvas rather than the raw file:
+```ts
+import Tesseract from 'tesseract.js';
+import imageCompression from 'browser-image-compression';
+import jscanify from 'jscanify';
+
+export async function runOcr(file: File): Promise<string> {
+  const compressed = file.type.startsWith('image/')
+    ? await imageCompression(file, { maxWidthOrHeight: 1500, maxSizeMB: 1.5, useWebWorker: true })
+    : file;
+
+  const source = await prepareSource(compressed); // HTMLCanvasElement | File
+  const { data } = await Tesseract.recognize(source, 'eng', { logger: () => {} });
+  return cleanOcrText(data.text);
+}
+```
+`prepareSource` loads the compressed image into an `<img>`, hands it to `jscanify.extractPaper`, and returns the canvas (or the original file on failure / PDFs).
+
+**Library: [`pdfjs-dist`](https://github.com/mozilla/pdf.js)** — for PDF receipts. Render page 1 to a canvas, then run it through the same jscanify → Tesseract path above.
+- Input: `ArrayBuffer` from `file.arrayBuffer()`
+- Output: `HTMLCanvasElement` of page 1 at ~2× scale for legibility
+
+**Text cleanup:** lowercase, collapse whitespace, drop lines shorter than 3 chars, cap at 8K chars before handing off to Groq. Plain string ops — no library needed.
 
 **Why client-side:** keeps the Vercel function under its 10–60s window and avoids server-side image processing.
 
@@ -266,11 +351,26 @@ Steps:
 
 **File:** [src/lib/groq/parseReceipt.ts](src/lib/groq/parseReceipt.ts)
 
+**Library: [`zod-to-json-schema`](https://github.com/StefanTerdell/zod-to-json-schema)** — generate the JSON schema string directly from the Zod schema and embed it in the system prompt. One source of truth: if the Zod schema changes, the prompt changes with it. Also improves Groq JSON-mode adherence.
+- Install: `npm i zod-to-json-schema`
+- Input: `zodToJsonSchema(parsedReceiptSchema, 'ParsedReceipt')`
+- Output: JSON Schema object → `JSON.stringify(..., null, 2)` into the system prompt template
+- **Do NOT use [`instructor-js`](https://github.com/instructor-ai/instructor-js)** — it auto-retries on Zod failure, which violates the global "no retry loops on Groq failures" rule.
+
+**Library: [`fuse.js`](https://www.fusejs.io/)** — fuzzy-map Groq's free-form category strings (e.g. `"romaine lettuce"`, `"baby spinach"`) to the canonical keys in `shelf_life_rules` (`"leafy_greens"`). Deterministic, server-side, zero tokens.
+- Install: `npm i fuse.js`
+- Input: list of `{ key, aliases[] }` built from `shelf_life_rules`, Fuse config `{ keys: ['key','aliases'], threshold: 0.4 }`
+- Output: `fuse.search(item.normalized_name)[0]?.item.key ?? 'other'` — the resolved category stored on `pantry_items.category`
+- Call inside the parse route, **after** Zod validation, **before** the insert.
+
 1. System prompt (kept short — token budget matters):
    ```
    You convert raw OCR text from grocery receipts into a JSON array of items.
-   Output ONLY valid JSON matching the schema. No prose.
+   Output ONLY valid JSON matching the schema below. No prose.
    Ignore non-food lines (totals, taxes, store name, addresses, payment info).
+
+   Schema:
+   <generated via zod-to-json-schema at module load>
    ```
 2. User prompt: just the cleaned OCR text.
 3. Use `response_format: { type: "json_object" }` and request a wrapper `{ "items": [...] }`.
@@ -279,12 +379,13 @@ Steps:
    {
      name: string,
      normalized_name: string,  // lowercase canonical, e.g. "milk", "chicken breast"
-     category: string,         // matches a key in shelf_life_rules
+     category: string,         // matches a key in shelf_life_rules (fuse-resolved server-side)
      quantity: number | null,
      unit: string | null
    }
    ```
 5. Validate with Zod; reject and log if invalid (do NOT re-prompt to keep cost down).
+6. After validation, resolve each item's `category` through the Fuse index so the DB never sees a category that isn't in `shelf_life_rules`.
 
 **File:** [src/app/api/receipts/parse/route.ts](src/app/api/receipts/parse/route.ts)
 
@@ -325,12 +426,19 @@ Steps:
 
 ### 2.1 Shelf-life rules
 
-1. Confirm `shelf_life_rules` is seeded with realistic defaults (research a single source like USDA FoodKeeper for ranges).
+**Data source: [USDA FoodKeeper dataset](https://catalog.data.gov/dataset/fsis-foodkeeper-data)** — public-domain JSON/CSV dataset with shelf-life ranges for hundreds of foods across pantry / fridge / freezer. Hand this file to the `shelf-life-researcher` subagent instead of manually researching ranges.
+- Input: `FoodKeeper.json` downloaded from data.gov
+- Output: `supabase/migrations/0002_shelf_life_seed.sql` (already shipped — re-run against the FoodKeeper extract if you want tighter ranges later)
+- Map FoodKeeper's `Name_subtitle` + `Keywords` columns onto your canonical category keys; pick the midpoint of the "Refrigerate After Opening" range as `default_days`.
+
+1. Confirm `shelf_life_rules` is seeded with realistic defaults from the FoodKeeper dataset.
 2. Add a `storage` column so rules can differ between fridge/pantry/frozen.
 
 ### 2.2 Estimator
 
 **File:** [src/lib/shelfLife/estimate.ts](src/lib/shelfLife/estimate.ts)
+
+**Library: [`date-fns`](https://date-fns.org/)** — already in deps. Use `addDays`, `differenceInDays`, `startOfDay` for all date math. Do not reach for `dayjs` or `moment`. No LLM in this file — ever.
 
 ```ts
 export type EstimateInput = {
@@ -390,49 +498,70 @@ Go with **Option A** for Phase 2.
 
 **Goal:** From the current pantry, generate 3–5 simple meal ideas that prioritize use-soon items.
 
+**New deps this phase:** none — Spoonacular and TheMealDB are plain `fetch` calls. Add `SPOONACULAR_API_KEY` to `.env`, `.env.example`, and Vercel Production.
+
+**Architecture shift (high-leverage):** Instead of asking Groq to invent meals from scratch — which is hallucination-prone, burns the bulk of your daily token budget, and produces generic recipes — fetch real recipes from a free recipe API keyed on pantry ingredients, then use Groq *only* to write the one-sentence "why this meal" reason. This cuts Groq TPM by ~80% and returns recipes with images, real ingredient lists, and accurate `missing_ingredients` arrays.
+
 ### 3.1 Suggestion endpoint
 
 **File:** [src/app/api/meals/suggest/route.ts](src/app/api/meals/suggest/route.ts)
 
-1. POST handler authenticated via Supabase server client.
-2. Load:
-   - All pantry items with `status in ('fresh','use_soon')`
-   - Mark which are `use_soon`
-3. Build a compact payload: `[{ name, category, status }, ...]` — drop ids, dates, ids to save tokens.
-4. Call `suggestMeals()` (below).
+**Library: [Spoonacular `findByIngredients`](https://spoonacular.com/food-api/docs#Search-Recipes-by-Ingredients)** (primary) — free tier 150 points/day (one `findByIngredients` call ≈ 1 point). Takes a comma-separated ingredient list and returns ranked recipes with `usedIngredients[]` and `missedIngredients[]` — literally the Phase 3 output shape, for free.
+- No SDK needed; native `fetch`.
+- Input: `GET https://api.spoonacular.com/recipes/findByIngredients?ingredients=spinach,chicken,rice&ranking=2&number=5&ignorePantry=true&apiKey=${SPOONACULAR_API_KEY}`
+  - `ranking=2` = minimize missing ingredients (better for "use what I have")
+- Output: `Array<{ id, title, image, usedIngredients: {name,amount,unit}[], missedIngredients: {name}[], likes }>`
+- Env var: add `SPOONACULAR_API_KEY` (server-only) to `.env`, `.env.example`, and Vercel Production.
 
-### 3.2 Groq meal suggester
+**Library: [TheMealDB `filter.php?i=`](https://www.themealdb.com/api.php)** (fallback, no key) — used when Spoonacular is quota-capped or errors out. Free, no auth, single-ingredient filter.
+- Input: `GET https://www.themealdb.com/api/json/v1/1/filter.php?i=chicken_breast`
+- Output: `{ meals: [{ idMeal, strMeal, strMealThumb }] }` — less rich than Spoonacular (no `missedIngredients`), but enough for a degraded experience.
+
+Steps:
+1. POST handler authenticated via Supabase server client.
+2. Load all pantry items with `status in ('fresh','use_soon')`, tag the use-soon ones.
+3. Build the ingredient list: `use_soon` items first, then `fresh`, cap at 20 names, join with commas.
+4. Call Spoonacular `findByIngredients` with `number=5&ranking=2`. On non-2xx or quota error, fall through to TheMealDB with the top `use_soon` ingredient.
+5. Pass the returned recipe titles + used ingredients to `generateMealReasons()` (Groq, see 3.2) to get the one-sentence reason per meal.
+6. Persist to `meal_suggestions` and return to client.
+
+### 3.2 Groq meal reason generator (trimmed)
 
 **File:** [src/lib/groq/suggestMeals.ts](src/lib/groq/suggestMeals.ts)
 
+Groq's only job here is writing the `reason` field for each meal Spoonacular already picked — a tiny prompt, a tiny output. The meal titles and ingredient lists come from Spoonacular; Groq never invents a recipe.
+
 1. System prompt:
    ```
-   You suggest 3 to 5 simple meals using the user's pantry items.
-   Prioritize items marked "use_soon".
-   Output ONLY valid JSON matching the schema. Be concise.
-   No nutrition claims. No long instructions.
+   For each meal, write ONE short sentence explaining why it's a good pick given
+   the user's pantry, especially items marked "use_soon". Output JSON only.
    ```
-2. User prompt: JSON of pantry items + a single line `"prioritize: [item1, item2]"`.
-3. JSON schema:
+2. User prompt: compact JSON like `{ meals: [{ title, uses: [...] }], useSoon: [...] }`.
+3. Output schema (Zod-validated):
    ```ts
-   {
-     meals: [
-       {
-         title: string,
-         ingredients_used: string[],
-         missing_ingredients: string[],
-         reason: string  // 1 sentence, e.g. "Uses your spinach which expires in 1 day."
-       }
-     ]
-   }
+   { reasons: Array<{ title: string; reason: string }> }
    ```
-4. Use `response_format: { type: "json_object" }`.
-5. Validate with Zod. If invalid, return a fallback empty list with a friendly message.
+4. Use `response_format: { type: "json_object" }` and `zod-to-json-schema` (same helper as 1.3) to embed the schema.
+5. Merge `reasons` back onto the Spoonacular recipes by `title` match. If a title has no matching reason, default to `""` — never block the response.
+6. Validate with Zod. On failure, return the Spoonacular meals with empty reasons (graceful degrade, no retry loop).
+
+Final `MealCard` shape stays what the UI already expects:
+```ts
+{
+  title: string,
+  image: string | null,
+  ingredients_used: string[],
+  missing_ingredients: string[],
+  reason: string
+}
+```
 
 ### 3.3 Token discipline (critical for free tier)
-- **Never** include receipt history, full item ids, dates, or quantities in the prompt.
-- Cap pantry list at 40 items; if more, send only top 40 by `use_soon` then by recency.
-- Cache last suggestion in `meal_suggestions` and reuse if pantry hasn't changed in the last hour.
+- Spoonacular does the heavy lifting — Groq prompt is now ~200 tokens instead of ~2K.
+- **Never** include receipt history, full item ids, dates, or quantities in any prompt.
+- Cap ingredient list sent to Spoonacular at 20 items; cap meals passed to Groq at 5.
+- Cache last suggestion in `meal_suggestions` and reuse if pantry hasn't changed in the last hour — this ALSO protects the Spoonacular quota, which is the new bottleneck.
+- Track Spoonacular point usage in the `withGroqGuard`-equivalent helper (or a parallel `withSpoonacularGuard`) so we don't blow the 150/day ceiling.
 
 ### 3.4 Meals page
 
@@ -458,20 +587,47 @@ Go with **Option A** for Phase 2.
 
 **Goal:** Move from demo to real-feeling app.
 
+**New deps this phase:**
+```bash
+npm i react-hook-form @hookform/resolvers @tremor/react recharts next-themes
+npx shadcn@latest add drawer   # pulls in vaul
+```
+
 ### 4.1 Pantry editing
+
+**Library: [`react-hook-form`](https://react-hook-form.com/) + [`@hookform/resolvers/zod`](https://github.com/react-hook-form/resolvers)** — reuse the Zod schemas from [src/lib/validation/schemas.ts](src/lib/validation/schemas.ts) for inline pantry-item edit forms. One line for validation, automatic dirty tracking, plays nicely with shadcn's `<Form>` wrapper.
+- Install: `npm i react-hook-form @hookform/resolvers`
+- Input: `useForm({ resolver: zodResolver(pantryItemSchema), defaultValues: item })`
+- Output: typed `handleSubmit((values) => …)` with field errors wired to shadcn `<FormMessage>`
+- Use on inline edit rows and the manual-add form (4.3).
+
 - Inline edit name, qty, category, expiration date.
 - Bulk select + delete.
 - "Mark used" button per item; sets `status='consumed'`.
 
 ### 4.2 Filters & search
+
+**Library: [`fuse.js`](https://www.fusejs.io/)** — already added in 1.3; reuse a client-side Fuse instance over the pantry list for the search box. Tolerates typos ("chiken" → "chicken breast") without needing a Postgres full-text index.
+- Input: `new Fuse(items, { keys: ['name','normalized_name','category'], threshold: 0.35 })`
+- Output: `fuse.search(query).map(r => r.item)` — debounced with a simple `useDeferredValue` or ~150ms setTimeout
+- Filter chips and category dropdown stay as plain `.filter()` calls — don't over-engineer.
+
 - Filter chips: All / Fresh / Use Soon / Expired / Consumed.
 - Category dropdown.
 - Text search on `normalized_name`.
 
 ### 4.3 Manual add
 - "Add item" form for items bought without a receipt.
+- Uses the same `react-hook-form` + `zodResolver` setup as 4.1.
 
 ### 4.4 Dashboard
+
+**Library: [`@tremor/react`](https://www.tremor.so/)** — pre-styled KPI cards, spark-lines, and bar charts built on Recharts. Matches shadcn's aesthetic out of the box and saves writing any chart boilerplate.
+- Install: `npm i @tremor/react` (pulls `recharts` as a peer dep)
+- Input: server-queried `{ inPantry, expiringThisWeek, mealsThisWeek, wastedThisMonth, weeklySeries: [{ date, added, used, wasted }] }`
+- Output: `<Card><Metric>…</Metric></Card>` for KPIs and `<BarChart data={weeklySeries} categories={['added','used','wasted']} />` for the weekly summary
+- Wire on [src/app/(app)/dashboard/page.tsx](src/app/(app)/dashboard/page.tsx).
+
 - KPIs: items in pantry, items expiring this week, meals suggested this week, items wasted this month.
 - Weekly summary card: added vs. used vs. wasted.
 - "Waste avoided" metric: count of items moved to `consumed` before `estimated_expiration_at`.
@@ -481,11 +637,23 @@ Go with **Option A** for Phase 2.
 - "Re-parse" button to retry Groq parsing.
 
 ### 4.6 UX polish
-- Toast notifications for all async actions.
-- Loading skeletons.
+
+**Library: [`next-themes`](https://github.com/pacocoursey/next-themes)** — two-line dark mode with no flash-of-wrong-theme. Pairs with shadcn's CSS variables already configured in 0.1.
+- Install: `npm i next-themes`
+- Input: wrap the app in `<ThemeProvider attribute="class" defaultTheme="system">` in `src/app/layout.tsx`
+- Output: `const { theme, setTheme } = useTheme()` inside the nav toggle
+
+**Library: [`vaul`](https://vaul.emilkowal.ski/)** — swipe-up mobile drawer for pantry item detail. Already a shadcn peer dep if you add the `drawer` component via `npx shadcn@latest add drawer`.
+- Input: `<Drawer open={…} onOpenChange={…}>` wrapping the item detail content
+- Output: native-feeling swipe gesture on mobile, modal on desktop
+
+**Library: [`sonner`](https://sonner.emilkowal.ski/)** — already installed in 0.1. Use `toast.success` / `toast.error` for every async action. No per-page setup — the `<Toaster />` lives once in the root layout.
+
+- Toast notifications for all async actions (sonner).
+- Loading skeletons (shadcn `Skeleton`).
 - Empty states with illustrations.
 - Mobile-responsive nav.
-- Dark mode (Tailwind + shadcn).
+- Dark mode via `next-themes`.
 
 ### 4.7 Exit criteria for Phase 4
 - All CRUD on pantry items works.
@@ -498,12 +666,44 @@ Go with **Option A** for Phase 2.
 
 Pick any depending on time.
 
-1. **Recurring grocery trends:** "You buy bananas every 4 days on average." Pure SQL aggregation.
-2. **Favorite meal suggestions:** Save meals; surface them again when ingredients are present.
-3. **Email reminders:** Supabase Edge Function on a schedule sends "items expiring in 2 days" digest. Use Resend free tier.
-4. **Shared household mode:** Add `households` table; pantry items belong to a household; invite via email link.
-5. **Barcode scanning:** `@zxing/browser` for camera barcode reads → product DB lookup.
-6. **CSV export:** download pantry / receipts as CSV.
+**New deps per feature (install only what you ship):**
+```bash
+# #3 Email reminders
+npm i resend @react-email/components
+# #5 Barcode scanning
+npm i @zxing/browser @zxing/library
+# #6 CSV export
+npm i papaparse
+npm i -D @types/papaparse
+```
+
+1. **Recurring grocery trends:** "You buy bananas every 4 days on average." Pure SQL — `date_trunc` + `lag()` window functions. No library; resist the urge to reach for `simple-statistics`.
+
+2. **Favorite meal suggestions:** Save meals; surface them again when ingredients are present. No new deps — just a `favorites` boolean on `meal_suggestions`.
+
+3. **Email reminders:**
+   - **Library: [`resend`](https://resend.com/)** (free tier 3K/mo, 100/day) + **[`react-email`](https://react.email/)** for typed JSX email templates.
+   - Install: `npm i resend @react-email/components`
+   - Input: `<ExpiringDigestEmail items={items} />` rendered with `render()` from `@react-email/components`
+   - Output: `await resend.emails.send({ from, to, subject, react: <ExpiringDigestEmail …/> })`
+   - Triggered from a Supabase scheduled Edge Function (`pg_cron` → HTTP POST to a Next route handler) once a day.
+
+4. **Shared household mode:** Add `households` table; pantry items belong to a household; invite via email link (reuse Resend from #3).
+
+5. **Barcode scanning:**
+   - **Library: [`@zxing/browser`](https://github.com/zxing-js/browser)** — camera-driven barcode reader in the browser.
+   - Install: `npm i @zxing/browser @zxing/library`
+   - Input: a `<video>` element ref → `new BrowserMultiFormatReader().decodeFromVideoDevice(undefined, videoEl, cb)`
+   - Output: `Result.getText()` = UPC/EAN string
+   - **Library: [Open Food Facts API](https://world.openfoodfacts.org/data)** (free, no key) for the UPC → product lookup. Skips OCR entirely for single-item adds.
+     - Input: `GET https://world.openfoodfacts.org/api/v2/product/{upc}.json`
+     - Output: `{ product: { product_name, categories_tags, brands } }` → map `categories_tags` through the Fuse category resolver from 1.3.
+
+6. **CSV export:**
+   - **Library: [`papaparse`](https://www.papaparse.com/)** — bulletproof CSV encoder. Handles quoting, commas-in-names, and BOM.
+   - Install: `npm i papaparse @types/papaparse`
+   - Input: `Papa.unparse(pantryRows, { columns: ['name','category','purchased_at','estimated_expiration_at','status'] })`
+   - Output: CSV string → wrap in a `Blob` and trigger a download link. ~5 lines total.
 
 ---
 

@@ -1,5 +1,15 @@
 # ShelfSense — Implementation Plan
 
+## Reusable Prompts
+
+**Plan mode:**
+> Plan {{PHASE/STEP}}. Follow PLAN.md for instructions. Include a thorough verification section that covers the happy path, every failure/rejection branch, auth/RLS gating, and any downstream stubs that will block full end-to-end success — spell out exact manual steps, expected UI states, expected DB/storage state, and how to confirm each one.
+
+**Edit automatically:**
+> Update .env.example, README.md, PLAN.md, and .gitignore so everything is current.
+
+---
+
 ShelfSense turns grocery receipts into a smart pantry. Users upload a receipt, OCR extracts text, Groq's `llama-3.1-8b-instant` parses items into structured data, the app estimates expiration windows, and suggests meals to reduce food waste.
 
 This document is the full step-by-step build plan, organized into phases. Each phase has a goal, deliverables, concrete steps, file-level scaffolding, and exit criteria.
@@ -236,6 +246,24 @@ Passwordless magic-link auth via `@supabase/ssr`. Shipped in these files:
 > - **Rebuild ritual.** `NEXT_PUBLIC_*` vars are inlined at build time, so changes in Vercel require a new build. Push an empty commit to `production` (`git commit --allow-empty -m … && git push origin production`) — the initial deployment was rebuilt this way after env vars landed.
 > - **Tracked gap:** the production URL `shelfsense-pi.vercel.app` is a Vercel-generated alias. If a custom domain is added later, update `NEXT_PUBLIC_SITE_URL` in Vercel, the Supabase Auth Site URL, and the Supabase redirect allow-list in lockstep.
 
+### 0.7 Dev auth bypass (local only, not a production path)
+
+> **Status: shipped (dev-only).** Iterating on `(app)/*` pages while waiting for magic-link emails was making every change take a minute. `AUTH_BYPASS=1` in `.env` now short-circuits the magic-link flow with a seeded dev user.
+>
+> **Mechanics:**
+> - [src/lib/auth/bypass.ts](src/lib/auth/bypass.ts) exposes `isAuthBypassed()` which returns `true` iff `process.env.AUTH_BYPASS === '1' && process.env.NODE_ENV !== 'production'`. Every code path that respects the flag routes through this helper — **the production gate is the `NODE_ENV` check**, so leaking `AUTH_BYPASS=1` into Vercel has no effect.
+> - [src/lib/auth/devUser.ts](src/lib/auth/devUser.ts) holds the fixed dev credentials (`dev@shelfsense.local` + a non-secret constant password). Only referenced by the dev-only route below.
+> - [src/app/api/dev/session/route.ts](src/app/api/dev/session/route.ts) is a Node-runtime GET handler that (1) refuses to run unless `isAuthBypassed()`, (2) uses `SUPABASE_SERVICE_ROLE_KEY` + `@supabase/supabase-js` admin API to `createUser({ email_confirm: true })` — idempotent, `already exists` errors are ignored — (3) creates an `@supabase/ssr` server client and calls `signInWithPassword` so real auth cookies land on the Next cookie store, and (4) redirects to `safeNext(request.nextUrl.searchParams.get('next'))`.
+> - [src/lib/supabase/middleware.ts](src/lib/supabase/middleware.ts) in bypass mode always lets `/api/dev/session` through, redirects `/login` + `/signup` to `/dashboard`, and for any protected prefix with no `sb-*-auth-token` cookie (including chunked `-auth-token.N` variants) redirects to `/api/dev/session?next=<pathname>`. First request self-heals; subsequent requests just pass through.
+> - [src/components/common/Nav.tsx](src/components/common/Nav.tsx) shows a small `auth bypass` chip in the top-right instead of the sign-out form when the flag is on. [src/app/page.tsx](src/app/page.tsx), [src/app/(auth)/login/page.tsx](src/app/(auth)/login/page.tsx), and [src/app/(auth)/signup/page.tsx](src/app/(auth)/signup/page.tsx) each short-circuit to `/dashboard` when `isAuthBypassed()` is true, so even direct-URL access can't reach the magic-link UI in dev.
+>
+> **How Phase 1.1 picks it up:** the `/receipts/upload` server component reads the user + session via `supabase.auth.getUser()` + `supabase.auth.getSession()`, then passes `userId`, `accessToken`, `refreshToken` down as props. The client `ReceiptUploader` calls `supabase.auth.setSession(...)` in a `useEffect` to force-hydrate the browser Supabase client's in-memory session. This sidesteps any client-side cookie-decode round-trip and guarantees storage uploads + DB writes carry a valid bearer token through RLS — without the uploader ever calling `auth.getUser()` on the client.
+>
+> **Rules of engagement:**
+> - **Never** set `AUTH_BYPASS` on Vercel. Force-disabled by `NODE_ENV` but leave it unset anyway for clarity.
+> - `SUPABASE_SERVICE_ROLE_KEY` has exactly one import site ([src/app/api/dev/session/route.ts](src/app/api/dev/session/route.ts)) and that route is gated by `isAuthBypassed()` before any admin call. `rls-security-auditor` should re-verify this invariant after any future auth-adjacent edit.
+> - When you want to test the real magic-link flow locally, delete `AUTH_BYPASS` from `.env` and restart dev. The dev user row stays in `auth.users` — harmless, delete from the Supabase dashboard if it bothers you.
+
 ---
 
 ## Phase 1 — Foundation MVP (Receipt → Pantry)
@@ -249,6 +277,12 @@ npm i react-dropzone browser-image-compression jscanify pdfjs-dist zod-to-json-s
 (`tesseract.js`, `zod`, `groq-sdk`, `date-fns` are already in the Phase 0 install.)
 
 ### 1.1 Receipt upload flow
+
+> **Status: shipped.** Only `react-dropzone` was installed for this sub-step (the other Phase-1 deps belong to 1.2 / 1.3 and are deferred). The pipeline is wired in `onDrop`: browser-client upload to `receipts/{user_id}/{uuid}.{ext}` → insert `receipts` row (`status='pending'`) → `runOcr(file)` → patch `ocr_text` + `status='ocr_done'` → `POST /api/receipts/parse` → `status='parsed'`. Progress states are `idle → uploading → ocr → parsing → done | error`; rejections (size, MIME) toast via `sonner`. The `/receipts/upload` page is now a server component that reads `auth.getUser()` + `auth.getSession()` and passes `userId`, `accessToken`, `refreshToken` as props to the client; the client calls `supabase.auth.setSession(...)` once in a `useEffect` to force-hydrate the in-memory session so the browser supabase client carries a real bearer token through RLS (no more client-side `getUser()` call). The "Upload receipt" link on `/receipts` is a plain `<a>` tag, not a `<Link>`, to bypass the Next App Router cache after we saw a stale redirect cached from an earlier iteration. `/receipts/upload` is marked `dynamic = 'force-dynamic'` + `revalidate = 0` so it never gets cached as a client prefetch.
+>
+> **End-to-end right now (as of 1.1 only):** upload → storage → DB row → `runOcr` throws (Phase 1.2 stub) → row flipped to `status='failed'` → UI shows `"OCR failed. Please try a clearer photo."`. This is the expected exit state of 1.1 in isolation and it's verified: photo lands in `receipts/{dev-user-uid}/<uuid>.jpeg`, a `failed` row appears in `public.receipts`. When 1.2 lands, this same uploader reaches `ocr_done` without further edits; when 1.3 lands it reaches `parsed` without further edits.
+>
+> **Notes for 1.2 handoff (`ocr-pipeline-specialist`):** the contract is unchanged — `runOcr(file: File): Promise<string>` in [src/lib/ocr/runOcr.ts](src/lib/ocr/runOcr.ts), currently throwing. The uploader doesn't care how the OCR works internally. For 1.2 you need to `npm i browser-image-compression jscanify pdfjs-dist` (deferred from 1.1 on purpose) and replace the stub body.
 
 **File:** [src/components/receipts/ReceiptUploader.tsx](src/components/receipts/ReceiptUploader.tsx)
 

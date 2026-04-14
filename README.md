@@ -26,10 +26,11 @@ Required env vars (see [.env.example](.env.example)):
 | Var | Scope | Notes |
 |---|---|---|
 | `NEXT_PUBLIC_SITE_URL` | public | Canonical origin for magic-link callbacks. Required in production; must be on the Supabase Auth redirect allow-list |
-| `NEXT_PUBLIC_SUPABASE_URL` | public | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_URL` | public | Supabase project API URL — `https://<project-ref>.supabase.co`. **Not** the dashboard URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | public | anon key, RLS-scoped |
-| `SUPABASE_SERVICE_ROLE_KEY` | **server-only** | never import from a client component |
+| `SUPABASE_SERVICE_ROLE_KEY` | **server-only** | never import from a client component. Also used by the dev auto-login route below |
 | `GROQ_API_KEY` | **server-only** | used by `/api` route handlers |
+| `AUTH_BYPASS` | **dev-only** | Set to `1` to skip the magic-link flow and auto-sign-in as a seeded dev user — see [Dev auth bypass](#dev-auth-bypass). Force-disabled in production |
 
 ### Supabase auth configuration
 
@@ -39,6 +40,19 @@ The app uses passwordless magic-link auth. Before the first login works end-to-e
 2. Set **Site URL** to match `NEXT_PUBLIC_SITE_URL`.
 3. Add `http://localhost:3000/auth/callback` and your production `…/auth/callback` to the **Redirect URLs** allow-list.
 4. Make sure **Enable email signups** is on (Authentication → Providers → Email).
+
+### Dev auth bypass
+
+Iterating on `(app)/*` pages while waiting for magic-link emails is slow. For local dev only, set `AUTH_BYPASS=1` in `.env` and restart `npm run dev`. When the flag is on:
+
+- `/login` and `/signup` both redirect to `/dashboard`, and the Nav hides the sign-out form and shows a small `auth bypass` chip instead.
+- The first request to any protected route bounces through [`/api/dev/session`](src/app/api/dev/session/route.ts), which uses `SUPABASE_SERVICE_ROLE_KEY` to create (or fetch) a fixed user `dev@shelfsense.local` via the admin API, then calls `signInWithPassword` so a real Supabase session cookie is set on your browser. Every subsequent request carries that cookie like a normal login.
+- The receipt uploader page hydrates its browser Supabase client from the server-side session using `supabase.auth.setSession(...)`, so storage uploads and DB writes go through RLS with a real bearer token (no ad-hoc service-role usage on the client).
+- The dev user's password is a hardcoded non-secret string in [src/lib/auth/devUser.ts](src/lib/auth/devUser.ts). It's only usable while `AUTH_BYPASS=1` and `NODE_ENV !== 'production'`.
+
+To turn it off, delete the `AUTH_BYPASS` line (or set it to anything other than `1`) and restart. The dev user remains in your Supabase project until you delete it from the dashboard — harmless.
+
+The bypass is force-disabled in production by [`isAuthBypassed()`](src/lib/auth/bypass.ts): it checks `NODE_ENV !== 'production'` before honouring the flag, so leaking `AUTH_BYPASS=1` into Vercel has no effect. Still, don't set it on Vercel — signal intent.
 
 ## Database setup
 
@@ -109,6 +123,8 @@ supabase/
 - **Phase 0.4 – app skeleton**: route groups `(auth)` and `(app)`, protected shell layout with `Nav`, stub API handlers for `/api/receipts/parse` and `/api/meals/suggest` (return `501` until wired), and lazy Supabase/Groq client helpers.
 - **Phase 0.5 – auth wiring**: passwordless magic-link sign-in via `@supabase/ssr`. Middleware redirects unauthed traffic from `(app)/*` to `/login?redirectTo=…` and bounces authed users off `/login` + `/signup`; fails closed when Supabase env vars are missing. `/auth/callback` handles the PKCE code exchange. `Nav` shows the signed-in email and a sign-out server action. Profile rows are created automatically by the `handle_new_user` trigger in `0001_init.sql`.
 - **Phase 0.6 – deploy**: live on Vercel Hobby with `production` as the tracked branch. Only pushes to `production` trigger a build (`vercel.json` blocks `main`, project-level `commandForIgnoringBuildStep` skips every other branch). Supabase migrations are applied to the linked remote project and the Auth dashboard is configured (Site URL, redirect allow-list, email signups). All five env vars are set in Vercel Production scope only. See [Deployment](#deployment) for the wiring.
+- **Phase 0.7 – dev auth bypass** *(local only)*: `AUTH_BYPASS=1` env flag + `/api/dev/session` admin-API auto-login + a fixed dev user (`dev@shelfsense.local`). Production-safe: gated by `isAuthBypassed()` which also checks `NODE_ENV !== 'production'`. See [Dev auth bypass](#dev-auth-bypass) for usage.
+- **Phase 1.1 – receipt upload flow**: `ReceiptUploader.tsx` is a real dropzone (`react-dropzone`, 8 MB limit, PNG/JPG/WEBP/PDF). The `/receipts/upload` page is a server component that reads the user + session and passes them as props; the client hydrates its browser Supabase client via `setSession(...)` on mount so storage + DB writes carry a real bearer token through RLS. Pipeline: browser-client upload to `receipts/{user_id}/{uuid}.{ext}` → insert `receipts` row (`status='pending'`) → `runOcr(file)` → patch to `ocr_done` → `POST /api/receipts/parse` → `parsed`. Rejection paths (too large, wrong MIME) surface via `sonner` toasts. OCR and parse are still the Phase 1.2 / 1.3 stubs, so the pipeline currently lands on `"OCR failed. Please try a clearer photo."` and flips the row to `status='failed'` — that's the happy path for 1.1 in isolation.
 
 ## Deployment
 
@@ -137,3 +153,9 @@ The `NEXT_PUBLIC_SITE_URL` value must match the Supabase Auth **Site URL** and a
 - Groq Free: 30 RPM, 6K TPM. Small prompts only, no history replay, no retry loops.
 - Groq model is text-only — OCR must complete before any Groq call.
 - Date math is deterministic, never delegated to the LLM.
+
+## Gotchas
+
+- **Webpack dev cache in memory.** [next.config.mjs](next.config.mjs) overrides `config.cache` to `{ type: 'memory' }` in dev only. Next.js 14's default filesystem pack cache races with file watchers and leaves half-renamed `.pack.gz_` files behind, producing `ENOENT` `unhandledRejection`s that can destabilize the dev server. Memory cache costs a few seconds on cold `npm run dev` startup but has zero disk IO. Production builds are unchanged.
+- **Router cache can serve stale redirects.** If you edit a `(app)/*` page so it starts or stops calling `redirect()`, the Next.js client router may still follow the old cached payload on navigation. Hard-refresh (Cmd/Ctrl+Shift+R) or close-and-reopen the tab to flush it. For routes like `/receipts/upload` whose session logic changes between phases, the safe pattern is `export const dynamic = 'force-dynamic'` + `revalidate = 0` plus `prefetch={false}` (or a plain `<a>`) on any inbound `Link`.
+- **Test fixtures stay local.** `photo_test_*.*` and `*.local.{jpg,jpeg,png,pdf}` are excluded via `.gitignore`. Drop your local receipts in those filenames and they'll never accidentally ride along in a commit.
